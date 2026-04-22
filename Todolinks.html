@@ -711,7 +711,7 @@
         <tr><td>переводчик, перевод, translate</td><td>Яндекс.Переводчик</td></tr>
         <tr><td>нейросеть, нейро, perplexity, перплексити</td><td>Perplexity AI</td></tr>
       </table>
-      <p><strong>Пример:</strong> <kbd>вики Тодолинкс</kbd> — откроет поиск в Википедии по слову «Тодолинкс».<br>Регистр букв не важен.</p>
+      <p><strong>Пример:</strong> <kbd>вики Тодолинкс</kbd> — откроет поиск в Википедии по слову «Тодолинкс».<br>Регистр букв не важен. <strong>Работает даже если вы забыли переключить раскладку!</strong> (например, <kbd>yt,bf</kbd> найдёт "медиа").</p>
 
       <h3>⌨️ Горячие клавиши</h3>
       <ul>
@@ -773,6 +773,41 @@
       { prefixes: ['нейросеть', 'нейро', 'perplexity', 'перплексити'], name: 'Perplexity', url: 'https://www.perplexity.ai/search?q=' }
     ];
 
+    // Карта раскладок для конвертации (русская <-> английская)
+    const layoutMap = {
+        ru: "ё1234567890-=йцукенгшщзхъфывапролджэячсмитьбю.Ё!\"№;%:?*()_+ЙЦУКЕНГШЩЗХЪФЫВАПРОЛДЖЭ/ЯЧСМИТЬБЮ,",
+        en: "`1234567890-=qwertyuiop[]asdfghjkl;'zxcvbnm,./~!@#$%^&*()_+QWERTYUIOP{}ASDFGHJKL:\"ZXCVBNM<>?"
+    };
+
+    function convertLayout(str, fromLayout, toLayout) {
+        let result = '';
+        for (let char of str) {
+            const index = layoutMap[fromLayout].indexOf(char);
+            result += index !== -1 ? layoutMap[toLayout][index] : char;
+        }
+        return result;
+    }
+
+    // Возвращает массив вариантов запроса: оригинал + перевёрнутая раскладка (если отличается)
+    function getSearchVariants(query) {
+        if (!query) return [''];
+        const variants = [query];
+        // Определяем, какой раскладки больше в строке
+        let ruCount = 0, enCount = 0;
+        for (let char of query) {
+            if (layoutMap.ru.includes(char)) ruCount++;
+            if (layoutMap.en.includes(char)) enCount++;
+        }
+        if (ruCount > enCount) {
+            const converted = convertLayout(query, 'ru', 'en');
+            if (converted !== query) variants.push(converted);
+        } else if (enCount > 0) {
+            const converted = convertLayout(query, 'en', 'ru');
+            if (converted !== query) variants.push(converted);
+        }
+        return variants;
+    }
+
     function generateId() { return crypto?.randomUUID?.() || Date.now() + '-' + Math.random().toString(36).substr(2, 9); }
     function normalizeUrl(u) { let s = u.trim(); return s && !/^https?:\/\//i.test(s) ? 'https://' + s : s; }
     function showToast(msg, err) { 
@@ -815,9 +850,45 @@
     async function deleteItem(id) { return new Promise((r, j) => { const tx = db.transaction(STORE_NAME, 'readwrite'); const s = tx.objectStore(STORE_NAME); const req = s.delete(id); req.onerror = j; req.onsuccess = r; }); }
     async function clearAllItems() { return new Promise((r, j) => { const tx = db.transaction(STORE_NAME, 'readwrite'); const s = tx.objectStore(STORE_NAME); const req = s.clear(); req.onerror = j; req.onsuccess = r; }); }
 
+    // Проверка поисковика с учётом вариантов раскладки
     function detectSearchEngine(v) {
-      const lv = v.toLowerCase();
-      for (const e of searchEngines) for (const p of e.prefixes) if (lv.startsWith(p + ' ')) return { e, q: v.slice(p.length + 1).trim() };
+      if (!v) return null;
+      const variants = getSearchVariants(v.trim());
+      for (const variant of variants) {
+        const lv = variant.toLowerCase();
+        for (const e of searchEngines) {
+          for (const p of e.prefixes) {
+            if (lv.startsWith(p + ' ')) {
+              // Нашли по варианту, но запрос нужно взять из оригинальной строки с правильным регистром?
+              // Проще: возьмём запрос после первого пробела в оригинале, но если конвертированная раскладка,
+              // то сам запрос тоже нужно конвертировать.
+              // Мы сделаем так: если вариант совпал, то возьмём часть после ключевого слова из ТОЙ ЖЕ строки,
+              // и если вариант был конвертирован, то и запрос конвертируем обратно в целевую раскладку.
+              const originalV = v.trim();
+              const prefixUsed = originalV.slice(0, p.length).toLowerCase() === p ? p : (() => {
+                // Ищем, какой префикс реально совпал в lowerCase
+                for (const pf of e.prefixes) {
+                  if (variant.toLowerCase().startsWith(pf + ' ')) return pf;
+                }
+                return p;
+              })();
+              const queryPart = variant.slice(prefixUsed.length + 1).trim();
+              // Если variant был получен конвертацией, нужно конвертировать queryPart обратно в исходную раскладку
+              let finalQuery = queryPart;
+              if (variant !== originalV) {
+                // variant — результат конвертации. Чтобы получить исходный запрос в правильной раскладке,
+                // мы можем конвертировать queryPart обратно.
+                if (ruCount > enCount) { // было ru->en
+                  finalQuery = convertLayout(queryPart, 'en', 'ru');
+                } else {
+                  finalQuery = convertLayout(queryPart, 'ru', 'en');
+                }
+              }
+              return { e, q: finalQuery };
+            }
+          }
+        }
+      }
       return null;
     }
 
@@ -839,10 +910,20 @@
 
     function filterItems(items, q) {
       if(!q) return items;
-      const lq = q.toLowerCase(); const syn = ['done', 'готово', 'выполнено', 'completed', 'finished']; const sc = syn.some(s => lq.includes(s));
+      const variants = getSearchVariants(q);
+      const lqVariants = variants.map(v => v.toLowerCase());
+      const syn = ['done', 'готово', 'выполнено', 'completed', 'finished'];
+      const sc = syn.some(s => lqVariants.some(lq => lq.includes(s)));
+      
       return items.filter(i => {
         if (sc) return i.type === 'todo' && i.todoStatus === 'completed';
-        return (i.title||'').toLowerCase().includes(lq)||(i.url||'').toLowerCase().includes(lq)||(i.description||'').toLowerCase().includes(lq)||(i.tags||[]).join(' ').toLowerCase().includes(lq);
+        // Проверяем по всем вариантам
+        return lqVariants.some(lq => 
+          (i.title||'').toLowerCase().includes(lq) ||
+          (i.url||'').toLowerCase().includes(lq) ||
+          (i.description||'').toLowerCase().includes(lq) ||
+          (i.tags||[]).join(' ').toLowerCase().includes(lq)
+        );
       });
     }
 
